@@ -23,7 +23,7 @@ pub struct Model {
 }
 
 impl Model {
-    /// For `/`, the average of the outputs (inverted only if all are), as wl-gammarelay-rs reports it
+    /// For `/`, the average of the outputs (inverted only if all are)
     pub fn color(&self, target: Target) -> Option<Color> {
         match target {
             Target::Output(id) => self.outputs.get(&id).map(|output| output.color),

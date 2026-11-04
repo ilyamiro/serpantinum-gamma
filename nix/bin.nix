@@ -28,12 +28,12 @@ pkgs.stdenv.mkDerivation {
     runHook preInstall
     mkdir -p $out
     cp -r bin share $out/
-    substituteInPlace $out/share/dbus-1/services/rs.wl-gammarelay.service --replace-fail /usr/bin $out/bin
+    substituteInPlace $out/share/dbus-1/services/org.serpantinum.Gamma.service --replace-fail /usr/bin $out/bin
     runHook postInstall
   '';
 
   meta = {
-    description = "Display temperature, brightness and gamma over D-Bus on Wayland, a drop-in for wl-gammarelay-rs";
+    description = "Display temperature, brightness and gamma over D-Bus on Wayland";
     homepage = "https://github.com/ilyamiro/serpantinum-gamma";
     license = lib.licenses.agpl3Plus;
     mainProgram = "serpantinum-gamma";

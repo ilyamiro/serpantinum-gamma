@@ -18,11 +18,11 @@ use crate::model::{Model, Target};
 use crate::wayland::Daemon;
 
 const USAGE: &str = "\
-Usage: serpantinum-gamma [run]
+Usage: serpantinum-gamma
 
-Serves rs.wl-gammarelay on the session bus, the interface of wl-gammarelay-rs:
-  busctl --user set-property rs.wl-gammarelay / rs.wl.gammarelay Temperature q 4000
-  busctl --user set-property rs.wl-gammarelay /outputs/eDP_1 rs.wl.gammarelay Brightness d 0.8
+Serves org.serpantinum.Gamma on the session bus:
+  busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma Temperature q 4000
+  busctl --user set-property org.serpantinum.Gamma /outputs/eDP_1 org.serpantinum.Gamma Brightness d 0.8
 
 Options:
   -h, --help     Show this help
@@ -35,7 +35,7 @@ enum Outcome {
 
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
-        None | Some("run") => {}
+        None => {}
         Some("-h" | "--help") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

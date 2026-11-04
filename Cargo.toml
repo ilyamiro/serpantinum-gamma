@@ -1,8 +1,8 @@
 [package]
 name = "serpantinum-gamma"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Display temperature, brightness and gamma over D-Bus on Wayland, a drop-in for wl-gammarelay-rs"
+description = "Display temperature, brightness and gamma over D-Bus on Wayland"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/ilyamiro/serpantinum-gamma"
 

@@ -10,12 +10,12 @@ use zbus::{Connection, interface};
 use crate::color::Color;
 use crate::model::{Model, Target};
 
-pub const BUS_NAME: &str = "rs.wl-gammarelay";
-pub const INTERFACE: &str = "rs.wl.gammarelay";
+pub const BUS_NAME: &str = "org.serpantinum.Gamma";
+pub const INTERFACE: &str = "org.serpantinum.Gamma";
 
 pub type Shared = Arc<Mutex<Model>>;
 
-/// The `rs.wl.gammarelay` interface on `/` or on one `/outputs/<name>`
+/// The `org.serpantinum.Gamma` interface on `/` or on one `/outputs/<name>`
 pub struct Relay {
     model: Shared,
     target: Target,
@@ -48,7 +48,7 @@ impl Relay {
     }
 }
 
-#[interface(name = "rs.wl.gammarelay")]
+#[interface(name = "org.serpantinum.Gamma")]
 impl Relay {
     async fn toggle_inverted(&self) {
         self.change(false, |model, target| model.toggle_inverted(target)).await;

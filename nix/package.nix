@@ -12,12 +12,12 @@ pkgs.rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   postInstall = ''
-    install -Dm644 assets/rs.wl-gammarelay.service $out/share/dbus-1/services/rs.wl-gammarelay.service
-    substituteInPlace $out/share/dbus-1/services/rs.wl-gammarelay.service --replace-fail @out@ $out
+    install -Dm644 assets/org.serpantinum.Gamma.service $out/share/dbus-1/services/org.serpantinum.Gamma.service
+    substituteInPlace $out/share/dbus-1/services/org.serpantinum.Gamma.service --replace-fail @out@ $out
   '';
 
   meta = {
-    description = "Display temperature, brightness and gamma over D-Bus on Wayland, a drop-in for wl-gammarelay-rs";
+    description = "Display temperature, brightness and gamma over D-Bus on Wayland";
     homepage = "https://github.com/ilyamiro/serpantinum-gamma";
     license = lib.licenses.agpl3Plus;
     mainProgram = "serpantinum-gamma";

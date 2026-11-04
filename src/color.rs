@@ -37,30 +37,76 @@ impl Color {
     }
 }
 
-// Tanner Helland's fit of the blackbody colour, in 0..=255 per channel
-fn helland(kelvin: f64) -> [f64; 3] {
-    let t = kelvin / 100.0;
-    let red = if t <= 66.0 { 255.0 } else { 329.698727446 * (t - 60.0).powf(-0.1332047592) };
-    let green = if t <= 66.0 {
-        99.4708025861 * t.ln() - 161.1195681661
-    } else {
-        288.1221695283 * (t - 60.0).powf(-0.0755148492)
-    };
-    let blue = if t >= 66.0 {
-        255.0
-    } else if t <= 19.0 {
-        0.0
-    } else {
-        138.5177312231 * (t - 10.0).ln() - 305.0447927307
-    };
-    [red.clamp(0.0, 255.0), green.clamp(0.0, 255.0), blue.clamp(0.0, 255.0)]
+// The white point is computed from physics rather than a curve fit:
+// 1. Planck's law gives the blackbody spectrum at the temperature.
+// 2. The CIE 1931 2° colour matching functions turn it into XYZ.
+// 3. A Bradford chromatic adaptation maps the 6500 K blackbody onto the display's D65 white, so
+//    6500 K changes nothing.
+// 4. The XYZ to linear sRGB matrix gives the channels, scaled so the brightest is 1.
+// 5. The sRGB transfer function encodes them, since a gamma ramp scales encoded values.
+
+type Vec3 = [f64; 3];
+type Mat3 = [Vec3; 3];
+
+const SRGB_FROM_XYZ: Mat3 =
+    [[3.2404542, -1.5371385, -0.4985314], [-0.9692660, 1.8760108, 0.0415560], [0.0556434, -0.2040259, 1.0572252]];
+const BRADFORD: Mat3 = [[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]];
+const BRADFORD_INVERSE: Mat3 =
+    [[0.9869929, -0.1470543, 0.1599627], [0.4323053, 0.5183603, 0.0492912], [-0.0085287, 0.0400428, 0.9684867]];
+const D65: Vec3 = [0.95047, 1.0, 1.08883];
+
+fn apply(matrix: &Mat3, v: Vec3) -> Vec3 {
+    matrix.map(|row| row[0] * v[0] + row[1] * v[1] + row[2] * v[2])
 }
 
-/// Per-channel multipliers in 0..=1, normalised so the neutral temperature is plain white
+// A piecewise Gaussian lobe, the building block of the CMF fit below
+fn lobe(x: f64, mean: f64, below: f64, above: f64) -> f64 {
+    let t = (x - mean) / if x < mean { below } else { above };
+    (-0.5 * t * t).exp()
+}
+
+// CIE 1931 2° colour matching functions, from the multi-lobe fit in Wyman, Sloan and Shirley,
+// "Simple Analytic Approximations to the CIE XYZ Color Matching Functions" (JCGT, 2013)
+fn color_matching(nm: f64) -> Vec3 {
+    [
+        1.056 * lobe(nm, 599.8, 37.9, 31.0) + 0.362 * lobe(nm, 442.0, 16.0, 26.7) - 0.065 * lobe(nm, 501.1, 20.4, 26.2),
+        0.821 * lobe(nm, 568.8, 46.9, 40.5) + 0.286 * lobe(nm, 530.9, 16.3, 31.1),
+        1.217 * lobe(nm, 437.0, 11.8, 36.0) + 0.681 * lobe(nm, 459.0, 26.0, 13.8),
+    ]
+}
+
+// Blackbody XYZ by Planck's law over the visible range, scaled to Y = 1
+fn blackbody_xyz(kelvin: f64) -> Vec3 {
+    const SECOND_RADIATION_CONSTANT: f64 = 1.438_776_877e-2; // h·c/k in m·K
+    let mut xyz = [0.0; 3];
+    for nm in 380..=780 {
+        let metres = nm as f64 * 1e-9;
+        let radiance = 1.0 / (metres.powi(5) * ((SECOND_RADIATION_CONSTANT / (metres * kelvin)).exp() - 1.0));
+        let cmf = color_matching(nm as f64);
+        for c in 0..3 {
+            xyz[c] += radiance * cmf[c];
+        }
+    }
+    xyz.map(|v| v / xyz[1])
+}
+
+fn srgb_encode(linear: f64) -> f64 {
+    if linear <= 0.0031308 { 12.92 * linear } else { 1.055 * linear.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// Per-channel multipliers in 0..=1 for the encoded signal; the neutral temperature is plain white
 pub fn white_point(kelvin: u16) -> [f64; 3] {
-    let reference = helland(NEUTRAL_TEMP as f64);
-    let color = helland(kelvin.clamp(TEMP_MIN, TEMP_MAX) as f64);
-    [0, 1, 2].map(|c| (color[c] / reference[c]).min(1.0))
+    let kelvin = kelvin.clamp(TEMP_MIN, TEMP_MAX);
+    if kelvin == NEUTRAL_TEMP {
+        return [1.0; 3];
+    }
+    let source = apply(&BRADFORD, blackbody_xyz(NEUTRAL_TEMP as f64));
+    let target = apply(&BRADFORD, D65);
+    let cone = apply(&BRADFORD, blackbody_xyz(kelvin as f64));
+    let adapted = apply(&BRADFORD_INVERSE, [0, 1, 2].map(|c| cone[c] * target[c] / source[c]));
+    let linear = apply(&SRGB_FROM_XYZ, adapted).map(|v| v.max(0.0));
+    let peak = linear.into_iter().fold(0.0, f64::max);
+    linear.map(|v| srgb_encode(v / peak))
 }
 
 /// The ramp the gamma control takes: `size` red values, then green, then blue
@@ -99,10 +145,32 @@ mod tests {
         assert_eq!(white_point(NEUTRAL_TEMP), [1.0, 1.0, 1.0]);
     }
 
+    fn assert_close(actual: [f64; 3], expected: [f64; 3]) {
+        for (a, e) in actual.into_iter().zip(expected) {
+            assert!((a - e).abs() < 1e-3, "{actual:?} is not {expected:?}");
+        }
+    }
+
+    // Reference values from an independent Python implementation of the same steps
+    #[test]
+    fn white_points_match_the_reference() {
+        assert_close(white_point(1000), [1.0, 0.1926, 0.0]);
+        assert_close(white_point(1900), [1.0, 0.5393, 0.0]);
+        assert_close(white_point(3000), [1.0, 0.7392, 0.4262]);
+        assert_close(white_point(4500), [1.0, 0.8911, 0.7372]);
+        assert_close(white_point(10000), [0.7989, 0.8704, 1.0]);
+    }
+
+    #[test]
+    fn white_point_is_continuous_around_neutral() {
+        assert_close(white_point(NEUTRAL_TEMP - 1), [1.0; 3]);
+        assert_close(white_point(NEUTRAL_TEMP + 1), [1.0; 3]);
+    }
+
     #[test]
     fn warm_temperature_keeps_red_and_cuts_blue() {
         let [red, green, blue] = white_point(3000);
-        assert_eq!(red, 1.0);
+        assert!((red - 1.0).abs() < 1e-9);
         assert!(green < 1.0 && blue < green);
     }
 
@@ -125,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn setters_clamp_like_wl_gammarelay_rs() {
+    fn setters_clamp_to_the_valid_ranges() {
         let color = Color::default();
         assert_eq!(color.with_temperature(500).temperature, TEMP_MIN);
         assert_eq!(color.with_temperature(20000).temperature, TEMP_MAX);
