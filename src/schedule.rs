@@ -29,11 +29,23 @@ impl Location {
     }
 }
 
+/// What one output follows: whether the schedule is on for it, and the temperatures it fades between
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Schedule {
+pub struct Plan {
     pub auto: bool,
     pub day_temperature: u16,
     pub night_temperature: u16,
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Plan { auto: false, day_temperature: 6500, night_temperature: 4000 }
+    }
+}
+
+/// When it is day and night, shared by every output
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Schedule {
     pub location: Option<Location>,
     /// Minutes after local midnight at which the fade to day starts, without a location
     pub fallback_day_start: u16,
@@ -43,14 +55,7 @@ pub struct Schedule {
 
 impl Default for Schedule {
     fn default() -> Self {
-        Schedule {
-            auto: false,
-            day_temperature: 6500,
-            night_temperature: 4000,
-            location: None,
-            fallback_day_start: 7 * 60,
-            fallback_night_start: 19 * 60,
-        }
+        Schedule { location: None, fallback_day_start: 7 * 60, fallback_night_start: 19 * 60 }
     }
 }
 
@@ -63,11 +68,11 @@ impl Schedule {
         }
     }
 
-    pub fn temperature(&self, now: &Now) -> u16 {
-        blend(self.day_temperature, self.night_temperature, self.night_fraction(now))
+    pub fn temperature(&self, plan: &Plan, now: &Now) -> u16 {
+        blend(plan.day_temperature, plan.night_temperature, self.night_fraction(now))
     }
 
-    /// What the Schedule interface shows at `now`
+    /// The Schedule properties every object shows alike, at `now`
     pub fn view(&self, now: &Now) -> View {
         let (has_location, latitude, longitude, sunrise, sunset, sun_elevation) = match self.location {
             Some(Location { latitude, longitude }) => {
@@ -79,9 +84,6 @@ impl Schedule {
             None => (false, 0.0, 0.0, 0, 0, 0.0),
         };
         View {
-            auto: self.auto,
-            day_temperature: self.day_temperature,
-            night_temperature: self.night_temperature,
             has_location,
             latitude,
             longitude,
@@ -94,12 +96,9 @@ impl Schedule {
     }
 }
 
-/// Every property of the Schedule interface
+/// The Schedule properties that are not part of a [`Plan`]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct View {
-    pub auto: bool,
-    pub day_temperature: u16,
-    pub night_temperature: u16,
     pub has_location: bool,
     pub latitude: f64,
     pub longitude: f64,
@@ -218,7 +217,7 @@ mod tests {
         assert!((0.3..0.5).contains(&expected));
         // Tokyo at the same moment is in deep night
         let tokyo = Schedule { location: Location::new(35.6762, 139.6503), ..schedule };
-        assert_eq!(tokyo.temperature(&now), 4000);
+        assert_eq!(tokyo.temperature(&Plan::default(), &now), 4000);
     }
 
     #[test]

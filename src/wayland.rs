@@ -12,7 +12,7 @@ use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_manager
 use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_v1::{self, ZwlrGammaControlV1};
 
 use crate::color::{Color, ramp_bytes};
-use crate::dbus::{self, Relay, Shared};
+use crate::dbus::{self, Relay, ScheduleRelay, Shared};
 use crate::model::{Target, object_path};
 
 // wl_output's name event arrived in version 4
@@ -104,9 +104,18 @@ impl Daemon {
             self.bus.inner().clone(),
             self.wake.clone(),
         );
-        if let Err(error) = self.bus.object_server().at(path.as_str(), relay) {
+        let schedule = ScheduleRelay::new(
+            self.model.clone(),
+            Target::Output(id),
+            path.clone(),
+            self.bus.inner().clone(),
+            self.wake.clone(),
+        );
+        let server = self.bus.object_server();
+        if let Err(error) = server.at(path.as_str(), relay).and_then(|_| server.at(path.as_str(), schedule)) {
             eprintln!("serpantinum-gamma: could not serve {path}: {error}");
         }
+        drop(server);
         self.reconcile();
     }
 
@@ -120,7 +129,10 @@ impl Daemon {
         if let Some(name) = slot.name {
             self.model.lock().unwrap().outputs.remove(&id);
             let path = object_path(&name);
-            if let Err(error) = self.bus.object_server().remove::<Relay, _>(path.as_str()) {
+            let server = self.bus.object_server();
+            if let Err(error) =
+                server.remove::<Relay, _>(path.as_str()).and_then(|_| server.remove::<ScheduleRelay, _>(path.as_str()))
+            {
                 eprintln!("serpantinum-gamma: could not stop serving {path}: {error}");
             }
         }

@@ -8,7 +8,7 @@ use zbus::{Connection, fdo, interface};
 use crate::clock::{self, Now};
 use crate::color::{Color, TEMP_MAX, TEMP_MIN};
 use crate::model::{Model, Target};
-use crate::schedule::{Location, MINUTES_PER_DAY, View};
+use crate::schedule::{Location, MINUTES_PER_DAY, Plan, View};
 
 pub const BUS_NAME: &str = "org.serpantinum.Gamma";
 pub const INTERFACE: &str = "org.serpantinum.Gamma";
@@ -19,13 +19,13 @@ pub type Shared = Arc<Mutex<Model>>;
 
 /// Everything the objects show, captured to tell which properties a change moved
 pub struct State {
-    colors: Vec<(String, Color)>,
+    objects: Vec<(String, Color, Plan)>,
     schedule: View,
 }
 
 impl State {
     pub fn capture(model: &Model, now: &Now) -> State {
-        State { colors: model.snapshot(), schedule: model.schedule.view(now) }
+        State { objects: model.snapshot(), schedule: model.schedule.view(now) }
     }
 }
 
@@ -34,7 +34,7 @@ impl State {
 pub enum Skip<'a> {
     Nothing,
     Color(&'a str),
-    Schedule(&'static str),
+    Schedule(&'a str, &'static str),
 }
 
 /// A `PropertiesChanged` signal to send: the object path, the interface and the changed values
@@ -105,10 +105,10 @@ impl Relay {
         send(&self.connection, signals).await;
     }
 
-    /// A temperature set by hand turns the schedule off
+    /// A temperature set by hand turns the schedule off for the same outputs
     async fn change_temperature(&self, from_setter: bool, change: impl Fn(Color) -> Color) {
         self.change(from_setter, |model, target| {
-            model.schedule.auto = false;
+            model.update_plan(target, |plan| Plan { auto: false, ..plan });
             model.update(target, change);
         })
         .await;
@@ -174,16 +174,24 @@ impl Relay {
     }
 }
 
-/// The `org.serpantinum.Gamma.Schedule` interface on `/`: one day and night schedule for every output
+/// The `org.serpantinum.Gamma.Schedule` interface on `/` or on one `/outputs/<name>`. Auto and the
+/// temperatures belong to the object, like the colour; the location and the fallback times are
+/// shared by every object.
 pub struct ScheduleRelay {
     model: Shared,
+    target: Target,
+    path: String,
     connection: Connection,
     wake: Ping,
 }
 
 impl ScheduleRelay {
-    pub fn new(model: Shared, connection: Connection, wake: Ping) -> Self {
-        ScheduleRelay { model, connection, wake }
+    pub fn new(model: Shared, target: Target, path: String, connection: Connection, wake: Ping) -> Self {
+        ScheduleRelay { model, target, path, connection, wake }
+    }
+
+    fn plan(&self) -> Plan {
+        self.model.lock().unwrap().plan(self.target).unwrap_or_default()
     }
 
     fn view(&self) -> View {
@@ -191,9 +199,15 @@ impl ScheduleRelay {
     }
 
     async fn change(&self, skip: Option<&'static str>, change: impl FnOnce(&mut Model)) {
-        let signals = apply(&self.model, skip.map_or(Skip::Nothing, Skip::Schedule), change);
+        let skip = skip.map_or(Skip::Nothing, |name| Skip::Schedule(&self.path, name));
+        let signals = apply(&self.model, skip, change);
         self.wake.ping();
         send(&self.connection, signals).await;
+    }
+
+    async fn change_plan(&self, name: &'static str, change: impl Fn(Plan) -> Plan) {
+        let target = self.target;
+        self.change(Some(name), |model| model.update_plan(target, change)).await;
     }
 }
 
@@ -223,34 +237,34 @@ impl ScheduleRelay {
 
     #[zbus(property)]
     fn auto(&self) -> bool {
-        self.view().auto
+        self.plan().auto
     }
 
     #[zbus(property)]
     async fn set_auto(&self, value: bool) {
-        self.change(Some("Auto"), |model| model.schedule.auto = value).await;
+        self.change_plan("Auto", |plan| Plan { auto: value, ..plan }).await;
     }
 
     #[zbus(property)]
     fn day_temperature(&self) -> u16 {
-        self.view().day_temperature
+        self.plan().day_temperature
     }
 
     #[zbus(property)]
     async fn set_day_temperature(&self, value: u16) {
         let value = value.clamp(TEMP_MIN, TEMP_MAX);
-        self.change(Some("DayTemperature"), |model| model.schedule.day_temperature = value).await;
+        self.change_plan("DayTemperature", |plan| Plan { day_temperature: value, ..plan }).await;
     }
 
     #[zbus(property)]
     fn night_temperature(&self) -> u16 {
-        self.view().night_temperature
+        self.plan().night_temperature
     }
 
     #[zbus(property)]
     async fn set_night_temperature(&self, value: u16) {
         let value = value.clamp(TEMP_MIN, TEMP_MAX);
-        self.change(Some("NightTemperature"), |model| model.schedule.night_temperature = value).await;
+        self.change_plan("NightTemperature", |plan| Plan { night_temperature: value, ..plan }).await;
     }
 
     #[zbus(property)]
@@ -325,16 +339,21 @@ fn changed_colors(old: &Color, new: &Color) -> HashMap<&'static str, Value<'stat
     changed
 }
 
-fn changed_schedule(old: &View, new: &View) -> HashMap<&'static str, Value<'static>> {
+fn changed_schedule(old: (&Plan, &View), new: (&Plan, &View)) -> HashMap<&'static str, Value<'static>> {
     let mut changed = HashMap::new();
     let mut check = |name, moved: bool, value: Value<'static>| {
         if moved {
             changed.insert(name, value);
         }
     };
-    check("Auto", old.auto != new.auto, new.auto.into());
-    check("DayTemperature", old.day_temperature != new.day_temperature, new.day_temperature.into());
-    check("NightTemperature", old.night_temperature != new.night_temperature, new.night_temperature.into());
+    let ((old_plan, old), (new_plan, new)) = (old, new);
+    check("Auto", old_plan.auto != new_plan.auto, new_plan.auto.into());
+    check("DayTemperature", old_plan.day_temperature != new_plan.day_temperature, new_plan.day_temperature.into());
+    check(
+        "NightTemperature",
+        old_plan.night_temperature != new_plan.night_temperature,
+        new_plan.night_temperature.into(),
+    );
     check("FallbackDayStart", old.fallback_day_start != new.fallback_day_start, new.fallback_day_start.into());
     check("FallbackNightStart", old.fallback_night_start != new.fallback_night_start, new.fallback_night_start.into());
     check("HasLocation", old.has_location != new.has_location, new.has_location.into());
@@ -349,7 +368,7 @@ fn changed_schedule(old: &View, new: &View) -> HashMap<&'static str, Value<'stat
 fn signals(before: &State, after: &State, skip: Skip) -> Vec<Signal> {
     let mut signals = Vec::new();
     // Both snapshots were taken under one lock, so they list the same objects in the same order
-    for ((path, old), (_, new)) in before.colors.iter().zip(&after.colors) {
+    for ((path, old, old_plan), (_, new, new_plan)) in before.objects.iter().zip(&after.objects) {
         let mut changed = changed_colors(old, new);
         if let Skip::Color(skipped) = skip
             && skipped == path
@@ -360,13 +379,15 @@ fn signals(before: &State, after: &State, skip: Skip) -> Vec<Signal> {
         if !changed.is_empty() {
             signals.push((path.clone(), INTERFACE, changed));
         }
-    }
-    let mut changed = changed_schedule(&before.schedule, &after.schedule);
-    if let Skip::Schedule(name) = skip {
-        changed.remove(name);
-    }
-    if !changed.is_empty() {
-        signals.push(("/".to_owned(), SCHEDULE_INTERFACE, changed));
+        let mut changed = changed_schedule((old_plan, &before.schedule), (new_plan, &after.schedule));
+        if let Skip::Schedule(skipped, name) = skip
+            && skipped == path
+        {
+            changed.remove(name);
+        }
+        if !changed.is_empty() {
+            signals.push((path.clone(), SCHEDULE_INTERFACE, changed));
+        }
     }
     signals
 }
@@ -375,31 +396,42 @@ fn signals(before: &State, after: &State, skip: Skip) -> Vec<Signal> {
 mod tests {
     use super::*;
 
-    fn state(temperatures: &[(&str, u16)], auto: bool) -> State {
-        let colors = temperatures.iter().map(|&(p, t)| (p.to_owned(), Color::default().with_temperature(t))).collect();
-        let mut model = Model::default();
-        model.schedule.auto = auto;
-        State { colors, schedule: model.schedule.view(&Now { unix: 0.0, local_minutes: 0.0 }) }
+    fn state(objects: &[(&str, u16, bool)]) -> State {
+        let objects = objects
+            .iter()
+            .map(|&(p, t, auto)| (p.to_owned(), Color::default().with_temperature(t), Plan { auto, ..Plan::default() }))
+            .collect();
+        State { objects, schedule: Model::default().schedule.view(&Now { unix: 0.0, local_minutes: 0.0 }) }
+    }
+
+    fn summary(signals: &[Signal]) -> Vec<(&str, &str, usize)> {
+        signals.iter().map(|(p, i, c)| (p.as_str(), *i, c.len())).collect()
     }
 
     #[test]
     fn signals_list_only_what_moved() {
-        let before = state(&[("/", 6500), ("/outputs/eDP_1", 6500), ("/outputs/DP_1", 6500)], true);
-        let after = state(&[("/", 5250), ("/outputs/eDP_1", 4000), ("/outputs/DP_1", 6500)], false);
+        let before = state(&[("/", 6500, false), ("/outputs/eDP_1", 6500, true), ("/outputs/DP_1", 6500, false)]);
+        let after = state(&[("/", 5250, false), ("/outputs/eDP_1", 4000, false), ("/outputs/DP_1", 6500, false)]);
         let signals = signals(&before, &after, Skip::Nothing);
-        let summary: Vec<_> = signals.iter().map(|(p, i, c)| (p.as_str(), *i, c.len())).collect();
-        assert_eq!(summary, [("/", INTERFACE, 1), ("/outputs/eDP_1", INTERFACE, 1), ("/", SCHEDULE_INTERFACE, 1)]);
+        assert_eq!(
+            summary(&signals),
+            [("/", INTERFACE, 1), ("/outputs/eDP_1", INTERFACE, 1), ("/outputs/eDP_1", SCHEDULE_INTERFACE, 1)]
+        );
     }
 
     #[test]
     fn a_setter_skips_its_own_property() {
-        let before = state(&[("/", 6500), ("/outputs/eDP_1", 6500)], true);
-        let after = state(&[("/", 4000), ("/outputs/eDP_1", 4000)], false);
+        let before = state(&[("/", 6500, true), ("/outputs/eDP_1", 6500, true)]);
+        let after = state(&[("/", 4000, false), ("/outputs/eDP_1", 4000, false)]);
         let signals = signals(&before, &after, Skip::Color("/outputs/eDP_1"));
         let paths: Vec<_> = signals.iter().map(|(p, i, _)| (p.as_str(), *i)).collect();
-        assert_eq!(paths, [("/", INTERFACE), ("/", SCHEDULE_INTERFACE)]);
+        assert_eq!(paths, [("/", INTERFACE), ("/", SCHEDULE_INTERFACE), ("/outputs/eDP_1", SCHEDULE_INTERFACE)]);
 
-        let signals = super::signals(&state(&[], true), &state(&[], false), Skip::Schedule("Auto"));
-        assert!(signals.is_empty());
+        let signals = super::signals(
+            &before,
+            &state(&[("/", 6500, false), ("/outputs/eDP_1", 6500, false)]),
+            Skip::Schedule("/", "Auto"),
+        );
+        assert_eq!(summary(&signals), [("/outputs/eDP_1", SCHEDULE_INTERFACE, 1)]);
     }
 }

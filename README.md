@@ -42,19 +42,20 @@ The bus name and the interface are both `org.serpantinum.Gamma`. `/` controls ev
 
 ## Day and night schedule
 
-The `org.serpantinum.Gamma.Schedule` interface on `/` changes the temperature of every output with
-the time of day. The daemon keeps no settings and finds no location itself: whatever starts it sets
-them, and they last until it exits.
+The `org.serpantinum.Gamma.Schedule` interface changes the temperature with the time of day. Like
+the colour, it is on `/` for every output and on `/outputs/<name>` for one. The daemon keeps no
+settings and finds no location itself: whatever starts it sets them, and they last until it exits.
 
 ```sh
 busctl --user call org.serpantinum.Gamma / org.serpantinum.Gamma.Schedule SetLocation dd 55.75 37.62
 busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma.Schedule NightTemperature q 3500
 busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma.Schedule Auto b true
+busctl --user set-property org.serpantinum.Gamma /outputs/HDMI_A_1 org.serpantinum.Gamma.Schedule Auto b false
 ```
 
 | Member | Type | Meaning |
 |---|---|---|
-| `Auto` | property `b` | follow the schedule; off at start |
+| `Auto` | property `b` | follow the schedule; off at start; on `/`, true only if every output follows it |
 | `DayTemperature`, `NightTemperature` | property `q` | default 6500 and 4000 K |
 | `SetLocation` | method `dd` | latitude −90..90 and longitude −180..180, in degrees |
 | `ClearLocation` | method | back to the fallback times |
@@ -63,6 +64,10 @@ busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma.Schedul
 | `Sunrise`, `Sunset` | read-only `t` | today's, in Unix seconds; 0 without a location or on a day without one |
 | `SunElevation` | read-only `d` | the sun's height in degrees now; 0 without a location |
 
+- `Auto`, `DayTemperature` and `NightTemperature` belong to each output. Writing them on `/` sets
+  them on every output, including outputs connected later, and reading them there gives the
+  average. The location and the fallback times are shared: setting them on any object sets them for
+  all, and every object shows the same values.
 - With a location, the temperature follows the sun's elevation: day at +2° and above, night at
   −4.5° and below, fading in between. That takes about 30–40 minutes at mid latitudes. The sun's
   position comes from NOAA's equations and agrees with PyEphem to about 0.01°.
@@ -74,7 +79,8 @@ busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma.Schedul
   daylight saving changes take effect at the next tick. Places without a sunrise or sunset, as in
   polar night, simply stay at night or day.
 - "Today" for `Sunrise` and `Sunset` is the system's local day.
-- Setting `Temperature` or calling `UpdateTemperature` on any object turns `Auto` off. Brightness,
+- Setting `Temperature` or calling `UpdateTemperature` turns `Auto` off on the same object, so on
+  every output for `/` and on that output alone for `/outputs/<name>`. Brightness,
   gamma and inversion are left alone by the schedule.
 - All properties emit `PropertiesChanged`, including the read-only ones as time passes.
 
