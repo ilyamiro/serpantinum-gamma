@@ -1,3 +1,4 @@
+mod cli;
 mod clock;
 mod color;
 mod dbus;
@@ -26,41 +27,24 @@ use crate::wayland::Daemon;
 // the colour can lag behind after a resume from suspend or a change of the clock or time zone.
 const TICK: Duration = Duration::from_secs(10);
 
-const USAGE: &str = "\
-Usage: serpantinum-gamma
-
-Serves org.serpantinum.Gamma on the session bus:
-  busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma Temperature q 4000
-  busctl --user set-property org.serpantinum.Gamma /outputs/eDP_1 org.serpantinum.Gamma Brightness d 0.8
-
-And a day and night schedule by the sun, on org.serpantinum.Gamma.Schedule:
-  busctl --user call org.serpantinum.Gamma / org.serpantinum.Gamma.Schedule SetLocation dd 55.75 37.62
-  busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma.Schedule Auto b true
-
-Options:
-  -h, --help     Show this help
-  -V, --version  Show the version";
-
 enum Outcome {
     Served,
     AlreadyRunning,
 }
 
 fn main() -> ExitCode {
-    match std::env::args().nth(1).as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
         None => {}
         Some("-h" | "--help") => {
-            println!("{USAGE}");
+            println!("{}", cli::USAGE);
             return ExitCode::SUCCESS;
         }
         Some("-V" | "--version") => {
             println!("serpantinum-gamma {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
-        Some(other) => {
-            eprintln!("serpantinum-gamma: unknown argument '{other}'\n\n{USAGE}");
-            return ExitCode::from(2);
-        }
+        Some(_) => return cli::run(&args),
     }
     match run() {
         Ok(Outcome::Served) => ExitCode::SUCCESS,

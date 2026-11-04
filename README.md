@@ -1,15 +1,38 @@
 # serpantinum-gamma
 
 A small daemon that sets display colour temperature, brightness, gamma and inversion on Wayland,
-controlled over D-Bus. It uses the `wlr-gamma-control-unstable-v1` protocol, supported by Hyprland,
+with a day and night schedule that follows the sun. The same binary is its command line client. It uses the `wlr-gamma-control-unstable-v1` protocol, supported by Hyprland,
 Sway, niri, mango and other wlroots-style compositors. GNOME and KDE don't support it.
 The binary links only glibc.
 
 ## Usage
 
 ```sh
-serpantinum-gamma &      # or let D-Bus start it, see below
+serpantinum-gamma start                                   # the daemon, in the background
+serpantinum-gamma set --temperature 4000                  # every output
+serpantinum-gamma set -o eDP-1 --brightness 0.8           # one output
+serpantinum-gamma auto on --night 3500                    # follow the schedule
+serpantinum-gamma location 55.75 37.62                    # by the sun at this place
+serpantinum-gamma fallback 06:30 19:00                    # or, without a location, by the clock
+serpantinum-gamma status -o eDP-1
+serpantinum-gamma reset
+serpantinum-gamma quit                                    # the compositor restores normal colours
+```
 
+`serpantinum-gamma --help` lists every command. Without `-o`, a command changes every output,
+including outputs connected later. A command for an output that was just connected waits up to
+two seconds for it to appear. Commands never start the daemon themselves, except `start`.
+
+The daemon keeps its colours only while it runs, since the compositor restores normal colours
+when a program's gamma control goes away. It can also run in the foreground, as plain
+`serpantinum-gamma`.
+
+## D-Bus
+
+The client talks to the daemon over the session bus, which any other program can use too. No
+systemd is needed, only a session bus.
+
+```sh
 busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma Temperature q 4000
 busctl --user -- call org.serpantinum.Gamma / org.serpantinum.Gamma UpdateTemperature n -100
 busctl --user set-property org.serpantinum.Gamma /outputs/eDP_1 org.serpantinum.Gamma Brightness d 0.8
