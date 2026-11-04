@@ -1,0 +1,21 @@
+[package]
+name = "serpantinum-gamma"
+version = "0.1.0"
+edition = "2024"
+description = "Display temperature, brightness and gamma over D-Bus on Wayland, a drop-in for wl-gammarelay-rs"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/ilyamiro/serpantinum-gamma"
+
+[dependencies]
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+rustix = { version = "1", features = ["fs"] }
+# The pure-Rust backend, so the binary links only glibc and needs no libwayland at run time
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+zbus = "5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
