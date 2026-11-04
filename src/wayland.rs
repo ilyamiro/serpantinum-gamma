@@ -11,12 +11,21 @@ use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1;
 use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_v1::{self, ZwlrGammaControlV1};
 
-use crate::color::{Color, ramp_bytes};
+use crate::color::{Color, ctm, ramp_bytes};
 use crate::dbus::{self, Relay, ScheduleRelay, Shared};
+use crate::hyprland::hyprland_ctm_control_manager_v1::{self, HyprlandCtmControlManagerV1};
 use crate::model::{Target, object_path};
 
 // wl_output's name event arrived in version 4
 const OUTPUT_VERSION: u32 = 4;
+
+/// How colours reach the compositor
+enum Backend {
+    /// wlr-gamma-control: a ramp per output, the choice of wlroots-style compositors
+    Gamma(ZwlrGammaControlManagerV1),
+    /// Hyprland's colour matrix control, which Hyprland offers in place of gamma ramps
+    Ctm(HyprlandCtmControlManagerV1),
+}
 
 struct Slot {
     id: u32,
@@ -33,7 +42,7 @@ pub struct Daemon {
     model: Shared,
     bus: zbus::blocking::Connection,
     wake: Ping,
-    manager: ZwlrGammaControlManagerV1,
+    backend: Backend,
     qh: QueueHandle<Daemon>,
     slots: Vec<Slot>,
     /// False until the bus name is ours: a gamma control is exclusive, so none is taken before
@@ -48,10 +57,13 @@ impl Daemon {
         bus: zbus::blocking::Connection,
         wake: Ping,
     ) -> Result<Daemon, String> {
-        let manager = globals
-            .bind(qh, 1..=1, ())
-            .map_err(|_| "the compositor does not support wlr-gamma-control-unstable-v1".to_owned())?;
-        let mut daemon = Daemon { model, bus, wake, manager, qh: qh.clone(), slots: Vec::new(), active: false };
+        let backend = match globals.bind(qh, 1..=2, ()) {
+            Ok(manager) => Backend::Ctm(manager),
+            Err(_) => Backend::Gamma(globals.bind(qh, 1..=1, ()).map_err(|_| {
+                "the compositor supports neither wlr-gamma-control-unstable-v1 nor hyprland-ctm-control-v1".to_owned()
+            })?),
+        };
+        let mut daemon = Daemon { model, bus, wake, backend, qh: qh.clone(), slots: Vec::new(), active: false };
         let registry = globals.registry();
         globals.contents().with_list(|list| {
             for global in list.iter().filter(|global| global.interface == WlOutput::interface().name) {
@@ -126,6 +138,7 @@ impl Daemon {
             control.destroy();
         }
         slot.output.release();
+        // The matrix of an output that is gone needs no reset, and the others keep theirs
         if let Some(name) = slot.name {
             self.model.lock().unwrap().outputs.remove(&id);
             let path = object_path(&name);
@@ -143,6 +156,29 @@ impl Daemon {
             return;
         }
         let model = self.model.lock().unwrap();
+        let manager = match &self.backend {
+            Backend::Gamma(manager) => manager,
+            Backend::Ctm(manager) => {
+                // A commit resets every output that was not set in it, so all go in each time
+                let wanted: Vec<_> =
+                    self.slots.iter().filter_map(|slot| Some((slot, model.outputs.get(&slot.id)?.color))).collect();
+                if wanted.iter().all(|(slot, color)| slot.applied == Some(*color)) {
+                    return;
+                }
+                for (slot, color) in &wanted {
+                    let [a, b, c, d, e, f, g, h, i] = ctm(*color);
+                    manager.set_ctm_for_output(&slot.output, a, b, c, d, e, f, g, h, i);
+                }
+                manager.commit();
+                let applied: Vec<_> = wanted.iter().map(|(slot, color)| (slot.id, *color)).collect();
+                for (id, color) in applied {
+                    if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == id) {
+                        slot.applied = Some(color);
+                    }
+                }
+                return;
+            }
+        };
         for slot in &mut self.slots {
             let Some(color) = model.outputs.get(&slot.id).map(|output| output.color) else { continue };
             if slot.failed {
@@ -150,7 +186,7 @@ impl Daemon {
             }
             let Some(control) = &slot.control else {
                 // The ramp is sent once the compositor answers with the ramp size
-                slot.control = Some(self.manager.get_gamma_control(&slot.output, &self.qh, slot.id));
+                slot.control = Some(manager.get_gamma_control(&slot.output, &self.qh, slot.id));
                 continue;
             };
             if slot.size == 0 || slot.applied == Some(color) {
@@ -216,6 +252,20 @@ impl Dispatch<ZwlrGammaControlManagerV1, ()> for Daemon {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<HyprlandCtmControlManagerV1, ()> for Daemon {
+    fn event(
+        _: &mut Self,
+        _: &HyprlandCtmControlManagerV1,
+        event: hyprland_ctm_control_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let hyprland_ctm_control_manager_v1::Event::Blocked = event;
+        eprintln!("serpantinum-gamma: Hyprland ignores this program's colours; another program holds the CTM control");
     }
 }
 

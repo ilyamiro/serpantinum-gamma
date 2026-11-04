@@ -96,6 +96,11 @@ fn srgb_encode(linear: f64) -> f64 {
 
 /// Per-channel multipliers in 0..=1 for the encoded signal; the neutral temperature is plain white
 pub fn white_point(kelvin: u16) -> [f64; 3] {
+    linear_white_point(kelvin).map(|v| if v >= 1.0 { 1.0 } else { srgb_encode(v) })
+}
+
+/// The same multipliers on linear light, which is what a colour matrix scales
+fn linear_white_point(kelvin: u16) -> [f64; 3] {
     let kelvin = kelvin.clamp(TEMP_MIN, TEMP_MAX);
     if kelvin == NEUTRAL_TEMP {
         return [1.0; 3];
@@ -106,7 +111,7 @@ pub fn white_point(kelvin: u16) -> [f64; 3] {
     let adapted = apply(&BRADFORD_INVERSE, [0, 1, 2].map(|c| cone[c] * target[c] / source[c]));
     let linear = apply(&SRGB_FROM_XYZ, adapted).map(|v| v.max(0.0));
     let peak = linear.into_iter().fold(0.0, f64::max);
-    linear.map(|v| srgb_encode(v / peak))
+    linear.map(|v| v / peak)
 }
 
 /// The ramp the gamma control takes: `size` red values, then green, then blue
@@ -122,6 +127,14 @@ pub fn ramp(size: usize, color: Color) -> Vec<u16> {
         }
     }
     values
+}
+
+/// The row-major 3x3 colour matrix of Hyprland's CTM control. A matrix cannot bend gamma or
+/// invert, since it is linear and its entries may not be negative, so only temperature and
+/// brightness are carried.
+pub fn ctm(color: Color) -> [f64; 9] {
+    let [r, g, b] = linear_white_point(color.temperature).map(|v| v * color.brightness);
+    [r, 0.0, 0.0, 0.0, g, 0.0, 0.0, 0.0, b]
 }
 
 pub fn ramp_bytes(size: usize, color: Color) -> Vec<u8> {
@@ -172,6 +185,15 @@ mod tests {
         let [red, green, blue] = white_point(3000);
         assert!((red - 1.0).abs() < 1e-9);
         assert!(green < 1.0 && blue < green);
+    }
+
+    #[test]
+    fn ctm_is_diagonal_and_scales_linear_light() {
+        assert_eq!(ctm(Color::default()), [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        let warm = ctm(Color { temperature: 3000, brightness: 0.5, ..Color::default() });
+        assert!((warm[0] - 0.5).abs() < 1e-9);
+        assert!(warm[4] < 0.5 && warm[8] < warm[4]);
+        assert!(warm.iter().all(|v| *v >= 0.0));
     }
 
     #[test]

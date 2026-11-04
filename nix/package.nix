@@ -7,7 +7,7 @@ pkgs.rustPlatform.buildRustPackage {
 
   src = lib.fileset.toSource {
     root = ./..;
-    fileset = lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../src ../assets ../LICENSE ];
+    fileset = lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../src ../protocols ../assets ../LICENSE ];
   };
   cargoLock.lockFile = ../Cargo.lock;
 

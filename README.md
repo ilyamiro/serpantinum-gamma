@@ -1,8 +1,12 @@
 # serpantinum-gamma
 
 A small daemon that sets display colour temperature, brightness, gamma and inversion on Wayland,
-with a day and night schedule that follows the sun. The same binary is its command line client. It uses the `wlr-gamma-control-unstable-v1` protocol, supported by Hyprland,
-Sway, niri, mango and other wlroots-style compositors. GNOME and KDE don't support it.
+with a day and night schedule that follows the sun. The same binary is its command line client. It uses the `wlr-gamma-control-unstable-v1` protocol, supported by
+Sway, niri, mango and other wlroots-style compositors, and on Hyprland, which no longer gives
+gamma ramps to clients, its own `hyprland-ctm-control-v1` colour matrix. The backend is picked on
+its own: Hyprland's if the compositor offers it, otherwise wlroots'. GNOME and KDE support neither.
+On Hyprland only temperature and brightness take effect; a matrix is linear, so gamma and
+inversion are accepted but have no effect there.
 The binary links only glibc.
 
 ## Usage

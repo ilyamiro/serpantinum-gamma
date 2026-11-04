@@ -595,14 +595,16 @@ dependencies = [
 
 [[package]]
 name = "serpantinum-gamma"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
  "libc",
  "rustix",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols-wlr",
+ "wayland-scanner",
  "zbus",
 ]
 

@@ -2,6 +2,7 @@ mod cli;
 mod clock;
 mod color;
 mod dbus;
+mod hyprland;
 mod model;
 mod schedule;
 mod solar;
