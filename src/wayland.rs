@@ -12,7 +12,7 @@ use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_manager
 use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_v1::{self, ZwlrGammaControlV1};
 
 use crate::color::{Color, ramp_bytes};
-use crate::dbus::{Relay, Shared};
+use crate::dbus::{self, Relay, Shared};
 use crate::model::{Target, object_path};
 
 // wl_output's name event arrived in version 4
@@ -63,6 +63,12 @@ impl Daemon {
 
     pub fn activate(&mut self) {
         self.active = true;
+        self.reconcile();
+    }
+
+    /// Applies the schedule for the current time and sends what changed
+    pub fn tick(&mut self) {
+        dbus::tick(&self.model, &self.bus);
         self.reconcile();
     }
 

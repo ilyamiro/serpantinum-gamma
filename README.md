@@ -40,6 +40,44 @@ The bus name and the interface are both `org.serpantinum.Gamma`. `/` controls ev
 - All properties emit `PropertiesChanged`, on the object that changed and on `/` when the average moves.
   Use `busctl --user monitor org.serpantinum.Gamma` to watch them.
 
+## Day and night schedule
+
+The `org.serpantinum.Gamma.Schedule` interface on `/` changes the temperature of every output with
+the time of day. The daemon keeps no settings and finds no location itself: whatever starts it sets
+them, and they last until it exits.
+
+```sh
+busctl --user call org.serpantinum.Gamma / org.serpantinum.Gamma.Schedule SetLocation dd 55.75 37.62
+busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma.Schedule NightTemperature q 3500
+busctl --user set-property org.serpantinum.Gamma / org.serpantinum.Gamma.Schedule Auto b true
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `Auto` | property `b` | follow the schedule; off at start |
+| `DayTemperature`, `NightTemperature` | property `q` | default 6500 and 4000 K |
+| `SetLocation` | method `dd` | latitude −90..90 and longitude −180..180, in degrees |
+| `ClearLocation` | method | back to the fallback times |
+| `FallbackDayStart`, `FallbackNightStart` | property `q` | minutes after local midnight, default 420 (07:00) and 1140 (19:00) |
+| `HasLocation`, `Latitude`, `Longitude` | read-only `b`, `d`, `d` | 0 without a location |
+| `Sunrise`, `Sunset` | read-only `t` | today's, in Unix seconds; 0 without a location or on a day without one |
+| `SunElevation` | read-only `d` | the sun's height in degrees now; 0 without a location |
+
+- With a location, the temperature follows the sun's elevation: day at +2° and above, night at
+  −4.5° and below, fading in between. That takes about 30–40 minutes at mid latitudes. The sun's
+  position comes from NOAA's equations and agrees with PyEphem to about 0.01°.
+- Without a location, the fade to night starts at `FallbackNightStart` and the fade to day at
+  `FallbackDayStart`, each lasting 30 minutes.
+- The fade is even in mireds (a million over the temperature), the scale on which equal steps look
+  equally large.
+- The schedule is applied every 10 seconds from the current clock, so suspend, time zone and
+  daylight saving changes take effect at the next tick. Places without a sunrise or sunset, as in
+  polar night, simply stay at night or day.
+- "Today" for `Sunrise` and `Sunset` is the system's local day.
+- Setting `Temperature` or calling `UpdateTemperature` on any object turns `Auto` off. Brightness,
+  gamma and inversion are left alone by the schedule.
+- All properties emit `PropertiesChanged`, including the read-only ones as time passes.
+
 ## Colour
 
 The colour for each temperature is computed from physics, not a curve fit:

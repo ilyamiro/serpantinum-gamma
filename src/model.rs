@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
+use crate::clock::Now;
 use crate::color::Color;
+use crate::schedule::{Schedule, View};
 
 /// What a D-Bus object controls: `/` (every output) or one `/outputs/<name>`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +22,10 @@ pub struct Model {
     /// The colour a newly connected output starts with; changes made on `/` change it too
     pub default: Color,
     pub outputs: BTreeMap<u32, Output>,
+    pub schedule: Schedule,
+    /// The Schedule properties as last signalled, so that changes made by time alone, like the
+    /// sun's elevation, are signalled too
+    pub signalled: Option<View>,
 }
 
 impl Model {
@@ -66,6 +72,14 @@ impl Model {
 
     pub fn add_output(&mut self, id: u32, name: String) {
         self.outputs.insert(id, Output { name, color: self.default });
+    }
+
+    /// While the schedule is on, sets every output's temperature to the scheduled one
+    pub fn apply_schedule(&mut self, now: &Now) {
+        if self.schedule.auto {
+            let temperature = self.schedule.temperature(now);
+            self.update(Target::Root, |color| color.with_temperature(temperature));
+        }
     }
 
     /// Every object's path with its colour, `/` first
@@ -135,6 +149,29 @@ mod tests {
         assert!(model.outputs.values().all(|o| o.color.inverted));
         model.toggle_inverted(Target::Root);
         assert!(model.outputs.values().all(|o| !o.color.inverted));
+    }
+
+    #[test]
+    fn schedule_sets_every_output_only_while_on() {
+        let mut model = two_outputs();
+        let night = Now { unix: 0.0, local_minutes: 0.0 };
+        model.apply_schedule(&night);
+        assert_eq!(model.color(Target::Root).unwrap().temperature, 6500);
+        model.schedule.auto = true;
+        model.apply_schedule(&night);
+        assert!(model.outputs.values().all(|o| o.color.temperature == 4000));
+        model.add_output(3, "DP-1".into());
+        assert_eq!(model.color(Target::Output(3)).unwrap().temperature, 4000);
+    }
+
+    #[test]
+    fn schedule_leaves_brightness_gamma_and_inversion_alone() {
+        let mut model = two_outputs();
+        model.update(Target::Root, |c| Color { inverted: true, ..c.with_brightness(0.6).with_gamma(1.3) });
+        model.schedule.auto = true;
+        model.apply_schedule(&Now { unix: 0.0, local_minutes: 0.0 });
+        let color = model.color(Target::Output(1)).unwrap();
+        assert_eq!((color.temperature, color.brightness, color.gamma, color.inverted), (4000, 0.6, 1.3, true));
     }
 
     #[test]
