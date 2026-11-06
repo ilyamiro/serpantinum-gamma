@@ -91,19 +91,35 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
+/// A command, the options it takes besides its words, and what it does. A test checks the options
+/// against [`USAGE`].
+struct Subcommand {
+    name: &'static str,
+    options: &'static [&'static str],
+    run: fn(&Parsed) -> Result<()>,
+}
+
+const COMMANDS: &[Subcommand] = &[
+    Subcommand { name: "start", options: &[], run: start },
+    Subcommand { name: "quit", options: &[], run: quit },
+    Subcommand { name: "status", options: &["--output"], run: status },
+    Subcommand {
+        name: "set",
+        options: &["--output", "--temperature", "--brightness", "--gamma", "--inverted"],
+        run: set,
+    },
+    Subcommand { name: "reset", options: &["--output"], run: reset },
+    Subcommand { name: "auto", options: &["--output", "--day", "--night"], run: auto },
+    Subcommand { name: "location", options: &[], run: location },
+    Subcommand { name: "fallback", options: &[], run: fallback },
+];
+
 fn command(args: &[String]) -> Result<()> {
     let Some((name, rest)) = args.split_first() else { return Err(usage("no command")) };
-    match name.as_str() {
-        "start" => parse(rest, &[])?.words::<0>().and_then(|_| start()),
-        "quit" => parse(rest, &[])?.words::<0>().and_then(|_| quit()),
-        "status" => status(&parse(rest, &["--output"])?),
-        "set" => set(&parse(rest, &["--output", "--temperature", "--brightness", "--gamma", "--inverted"])?),
-        "reset" => reset(&parse(rest, &["--output"])?),
-        "auto" => auto(&parse(rest, &["--output", "--day", "--night"])?),
-        "location" => location(&parse(rest, &[])?),
-        "fallback" => fallback(&parse(rest, &[])?),
-        other => Err(usage(format!("unknown command '{other}'"))),
-    }
+    let Some(subcommand) = COMMANDS.iter().find(|subcommand| subcommand.name == name) else {
+        return Err(usage(format!("unknown command '{name}'")));
+    };
+    (subcommand.run)(&parse(rest, subcommand.options)?)
 }
 
 /// A command's words and `--name value` options
@@ -221,7 +237,8 @@ fn target(conn: &Connection, output: Option<&str>) -> Result<String> {
     }
 }
 
-fn start() -> Result<()> {
+fn start(parsed: &Parsed) -> Result<()> {
+    parsed.words::<0>()?;
     let conn = connect()?;
     if running(&conn)? {
         return Ok(());
@@ -254,7 +271,8 @@ fn start() -> Result<()> {
     Err(failed("the daemon did not start in time"))
 }
 
-fn quit() -> Result<()> {
+fn quit(parsed: &Parsed) -> Result<()> {
+    parsed.words::<0>()?;
     let conn = connect()?;
     let Ok(pid) = DBusProxy::new(&conn)?.get_connection_unix_process_id(bus_name()) else { return Ok(()) };
     let pid = pid as libc::pid_t;
@@ -289,6 +307,7 @@ fn status(parsed: &Parsed) -> Result<()> {
     println!("brightness {}", color.get_property::<f64>("Brightness")?);
     println!("gamma {}", color.get_property::<f64>("Gamma")?);
     println!("inverted {}", color.get_property::<bool>("Inverted")?);
+    println!("blocked {}", color.get_property::<bool>("Blocked")?);
     println!("auto {}", schedule.get_property::<bool>("Auto")?);
     println!("day-temperature {}", schedule.get_property::<u16>("DayTemperature")?);
     println!("night-temperature {}", schedule.get_property::<u16>("NightTemperature")?);
@@ -438,6 +457,27 @@ mod tests {
         assert!(clock_minutes("7").is_err());
         assert!(clock_minutes("07:60").is_err());
         assert!(clock_minutes("07:000").is_err());
+    }
+
+    #[test]
+    fn the_help_lists_the_options_each_command_takes() {
+        for command in COMMANDS {
+            // The command's lines: the one that starts with its name and those indented further
+            let mut lines = USAGE.lines().skip_while(|line| line.split_whitespace().next() != Some(command.name));
+            let mut text = lines.next().unwrap().to_owned();
+            for line in lines.take_while(|line| line.starts_with("   ")) {
+                text.push_str(line);
+            }
+            assert_eq!(text.contains("-o OUTPUT"), command.options.contains(&"--output"), "{}", command.name);
+            let mut documented: Vec<_> = text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .filter(|word| word.starts_with("--"))
+                .collect();
+            let mut taken: Vec<_> = command.options.iter().copied().filter(|&option| option != "--output").collect();
+            documented.sort();
+            taken.sort();
+            assert_eq!(documented, taken, "{}", command.name);
+        }
     }
 
     #[test]

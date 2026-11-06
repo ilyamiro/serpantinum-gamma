@@ -53,6 +53,7 @@ The bus name and the interface are both `org.serpantinum.Gamma`. `/` controls ev
 | `Brightness` | property `d` | 0–1 |
 | `Gamma` | property `d` | at least 0.1, 1 is neutral |
 | `Inverted` | property `b` | |
+| `Blocked` | read-only property `b` | true while the compositor ignores the colours, as when another program holds the control; not signalled |
 | `UpdateTemperature` | method `n` | adds a delta |
 | `UpdateBrightness`, `UpdateGamma` | method `d` | adds a delta |
 | `ToggleInverted` | method | |

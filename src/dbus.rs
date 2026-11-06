@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use calloop::ping::Ping;
 use zbus::zvariant::Value;
@@ -16,6 +16,12 @@ pub const SCHEDULE_INTERFACE: &str = "org.serpantinum.Gamma.Schedule";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 
 pub type Shared = Arc<Mutex<Model>>;
+
+/// Locks the model. A panic elsewhere while it was held leaves the model as it was, which is still
+/// usable, so a poisoned lock is not worth failing every later call for.
+pub fn lock(model: &Shared) -> MutexGuard<'_, Model> {
+    model.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Everything the objects show, captured to tell which properties a change moved
 pub struct State {
@@ -43,7 +49,7 @@ pub type Signal = (String, &'static str, HashMap<&'static str, Value<'static>>);
 /// Runs `change` and the schedule on the model, and returns the signals for what moved
 fn apply(model: &Shared, skip: Skip, change: impl FnOnce(&mut Model)) -> Vec<Signal> {
     let now = clock::now();
-    let mut model = model.lock().unwrap();
+    let mut model = lock(model);
     let mut before = State::capture(&model, &now);
     if let Some(signalled) = model.signalled {
         before.schedule = signalled;
@@ -58,28 +64,38 @@ fn apply(model: &Shared, skip: Skip, change: impl FnOnce(&mut Model)) -> Vec<Sig
 /// Applies the schedule as time passes; called from the event loop
 pub fn tick(model: &Shared, bus: &zbus::blocking::Connection) {
     for (path, interface, changed) in apply(model, Skip::Nothing, |_| {}) {
-        let body = (interface, changed, Vec::<&str>::new());
-        if let Err(error) =
-            bus.emit_signal(None::<&str>, path.as_str(), PROPERTIES_INTERFACE, "PropertiesChanged", &body)
-        {
-            eprintln!("serpantinum-gamma: could not signal a change on {path}: {error}");
-        }
+        let body = properties_changed(interface, changed);
+        let sent = bus.emit_signal(None::<&str>, path.as_str(), PROPERTIES_INTERFACE, "PropertiesChanged", &body);
+        report(&path, sent);
     }
 }
 
 async fn send(connection: &Connection, signals: Vec<Signal>) {
     for (path, interface, changed) in signals {
-        let body = (interface, changed, Vec::<&str>::new());
-        if let Err(error) =
-            connection.emit_signal(None::<&str>, path.as_str(), PROPERTIES_INTERFACE, "PropertiesChanged", &body).await
-        {
-            eprintln!("serpantinum-gamma: could not signal a change on {path}: {error}");
-        }
+        let body = properties_changed(interface, changed);
+        let sent =
+            connection.emit_signal(None::<&str>, path.as_str(), PROPERTIES_INTERFACE, "PropertiesChanged", &body).await;
+        report(&path, sent);
     }
 }
 
-/// The `org.serpantinum.Gamma` interface on `/` or on one `/outputs/<name>`
-pub struct Relay {
+fn properties_changed(
+    interface: &'static str,
+    changed: HashMap<&'static str, Value<'static>>,
+) -> (&'static str, HashMap<&'static str, Value<'static>>, Vec<&'static str>) {
+    (interface, changed, Vec::new())
+}
+
+fn report(path: &str, sent: zbus::Result<()>) {
+    if let Err(error) = sent {
+        eprintln!("serpantinum-gamma: could not signal a change on {path}: {error}");
+    }
+}
+
+/// What the two interfaces of one object share: the model, what the object controls, and the way
+/// to signal and to wake the Wayland side
+#[derive(Clone)]
+pub struct Handle {
     model: Shared,
     target: Target,
     path: String,
@@ -87,22 +103,51 @@ pub struct Relay {
     wake: Ping,
 }
 
-impl Relay {
+impl Handle {
     pub fn new(model: Shared, target: Target, path: String, connection: Connection, wake: Ping) -> Self {
-        Relay { model, target, path, connection, wake }
+        Handle { model, target, path, connection, wake }
     }
 
-    fn color(&self) -> Color {
-        self.model.lock().unwrap().color(self.target).unwrap_or_default()
-    }
-
-    /// Applies `change`, wakes the Wayland side to send the new ramps, and signals every object
-    /// whose values moved. A property setter skips its own property, which zbus signals itself.
-    async fn change(&self, from_setter: bool, change: impl FnOnce(&mut Model, Target)) {
-        let skip = if from_setter { Skip::Color(&self.path) } else { Skip::Nothing };
-        let signals = apply(&self.model, skip, |model| change(model, self.target));
+    /// Applies `change`, wakes the Wayland side to send the new colours, and signals every object
+    /// whose values moved except for the property `skip` names, which zbus signals itself
+    async fn change(&self, skip: Skip<'_>, change: impl FnOnce(&mut Model)) {
+        let signals = apply(&self.model, skip, change);
         self.wake.ping();
         send(&self.connection, signals).await;
+    }
+}
+
+/// Serves both interfaces at the handle's path
+pub fn serve(bus: &zbus::blocking::Connection, handle: Handle) -> zbus::Result<()> {
+    let path = handle.path.clone();
+    let server = bus.object_server();
+    server.at(path.as_str(), Relay { handle: handle.clone() })?;
+    server.at(path.as_str(), ScheduleRelay { handle })?;
+    Ok(())
+}
+
+pub fn unserve(bus: &zbus::blocking::Connection, path: &str) -> zbus::Result<()> {
+    let server = bus.object_server();
+    server.remove::<Relay, _>(path)?;
+    server.remove::<ScheduleRelay, _>(path)?;
+    Ok(())
+}
+
+/// The `org.serpantinum.Gamma` interface on `/` or on one `/outputs/<name>`
+pub struct Relay {
+    handle: Handle,
+}
+
+impl Relay {
+    fn color(&self) -> Color {
+        lock(&self.handle.model).color(self.handle.target).unwrap_or_default()
+    }
+
+    /// A property setter skips its own property
+    async fn change(&self, from_setter: bool, change: impl FnOnce(&mut Model, Target)) {
+        let skip = if from_setter { Skip::Color(&self.handle.path) } else { Skip::Nothing };
+        let target = self.handle.target;
+        self.handle.change(skip, |model| change(model, target)).await;
     }
 
     /// A temperature set by hand turns the schedule off for the same outputs
@@ -172,41 +217,38 @@ impl Relay {
     async fn set_inverted(&self, value: bool) {
         self.change(true, |model, target| model.update(target, |c| Color { inverted: value, ..c })).await;
     }
+
+    /// Whether the compositor ignores this object's colours, as when another program holds the
+    /// control. It is not signalled when it changes.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn blocked(&self) -> bool {
+        lock(&self.handle.model).blocked(self.handle.target)
+    }
 }
 
 /// The `org.serpantinum.Gamma.Schedule` interface on `/` or on one `/outputs/<name>`. Auto and the
 /// temperatures belong to the object, like the colour; the location and the fallback times are
 /// shared by every object.
 pub struct ScheduleRelay {
-    model: Shared,
-    target: Target,
-    path: String,
-    connection: Connection,
-    wake: Ping,
+    handle: Handle,
 }
 
 impl ScheduleRelay {
-    pub fn new(model: Shared, target: Target, path: String, connection: Connection, wake: Ping) -> Self {
-        ScheduleRelay { model, target, path, connection, wake }
-    }
-
     fn plan(&self) -> Plan {
-        self.model.lock().unwrap().plan(self.target).unwrap_or_default()
+        lock(&self.handle.model).plan(self.handle.target).unwrap_or_default()
     }
 
     fn view(&self) -> View {
-        self.model.lock().unwrap().schedule.view(&clock::now())
+        lock(&self.handle.model).view(&clock::now())
     }
 
-    async fn change(&self, skip: Option<&'static str>, change: impl FnOnce(&mut Model)) {
-        let skip = skip.map_or(Skip::Nothing, |name| Skip::Schedule(&self.path, name));
-        let signals = apply(&self.model, skip, change);
-        self.wake.ping();
-        send(&self.connection, signals).await;
+    async fn change(&self, setter: Option<&'static str>, change: impl FnOnce(&mut Model)) {
+        let skip = setter.map_or(Skip::Nothing, |name| Skip::Schedule(&self.handle.path, name));
+        self.handle.change(skip, change).await;
     }
 
     async fn change_plan(&self, name: &'static str, change: impl Fn(Plan) -> Plan) {
-        let target = self.target;
+        let target = self.handle.target;
         self.change(Some(name), |model| model.update_plan(target, change)).await;
     }
 }

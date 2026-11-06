@@ -20,7 +20,7 @@ use wayland_client::Connection;
 use wayland_client::globals::registry_queue_init;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
-use crate::dbus::{BUS_NAME, Relay, ScheduleRelay};
+use crate::dbus::{BUS_NAME, Handle};
 use crate::model::{Model, Target};
 use crate::wayland::Daemon;
 
@@ -72,10 +72,8 @@ fn run() -> Result<Outcome, String> {
     // Learn the outputs' names and serve every object before taking the name, so a client that sees
     // the name also finds /outputs/<name>
     queue.roundtrip(&mut daemon).map_err(|e| e.to_string())?;
-    let root = Relay::new(model.clone(), Target::Root, "/".to_owned(), bus.inner().clone(), wake.clone());
-    bus.object_server().at("/", root).map_err(|e| e.to_string())?;
-    let schedule = ScheduleRelay::new(model, Target::Root, "/".to_owned(), bus.inner().clone(), wake);
-    bus.object_server().at("/", schedule).map_err(|e| e.to_string())?;
+    let root = Handle::new(model, Target::Root, "/".to_owned(), bus.inner().clone(), wake);
+    dbus::serve(&bus, root).map_err(|e| e.to_string())?;
 
     match bus.request_name_with_flags(BUS_NAME, RequestNameFlags::DoNotQueue.into()) {
         Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {}

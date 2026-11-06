@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
 
 use calloop::ping::Ping;
 use rustix::fs::{MemfdFlags, memfd_create};
@@ -12,14 +13,18 @@ use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_manager
 use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_v1::{self, ZwlrGammaControlV1};
 
 use crate::color::{Color, ctm, ramp_bytes};
-use crate::dbus::{self, Relay, ScheduleRelay, Shared};
+use crate::dbus::{self, Handle, Shared, lock};
 use crate::hyprland::hyprland_ctm_control_manager_v1::{self, HyprlandCtmControlManagerV1};
 use crate::model::{Target, object_path};
 
 // wl_output's name event arrived in version 4
 const OUTPUT_VERSION: u32 = 4;
 
+/// How long an output that refused a gamma control is left alone before a D-Bus change tries again
+const RETRY: Duration = Duration::from_secs(30);
+
 /// How colours reach the compositor
+#[derive(Clone)]
 enum Backend {
     /// wlr-gamma-control: a ramp per output, the choice of wlroots-style compositors
     Gamma(ZwlrGammaControlManagerV1),
@@ -34,7 +39,8 @@ struct Slot {
     control: Option<ZwlrGammaControlV1>,
     size: u32,
     applied: Option<Color>,
-    failed: bool,
+    /// When the compositor refused a gamma control for this output
+    failed: Option<Instant>,
 }
 
 /// The Wayland side: one gamma control per output, kept in line with the model
@@ -84,10 +90,13 @@ impl Daemon {
         self.reconcile();
     }
 
-    /// A D-Bus change came in. Outputs that refused a control get another try.
+    /// A D-Bus change came in. Outputs that refused a control get another try, but not so often that
+    /// an output held by another program fills the log.
     pub fn woken(&mut self) {
         for slot in &mut self.slots {
-            slot.failed = false;
+            if slot.failed.is_some_and(|at| at.elapsed() >= RETRY) {
+                slot.failed = None;
+            }
         }
         self.reconcile();
     }
@@ -98,7 +107,7 @@ impl Daemon {
             return;
         }
         let output = registry.bind::<WlOutput, _, _>(id, OUTPUT_VERSION, &self.qh, id);
-        self.slots.push(Slot { id, output, name: None, control: None, size: 0, applied: None, failed: false });
+        self.slots.push(Slot { id, output, name: None, control: None, size: 0, applied: None, failed: None });
     }
 
     fn output_named(&mut self, id: u32, name: String) {
@@ -108,26 +117,17 @@ impl Daemon {
         }
         slot.name = Some(name.clone());
         let path = object_path(&name);
-        self.model.lock().unwrap().add_output(id, name);
-        let relay = Relay::new(
+        lock(&self.model).add_output(id, name);
+        let handle = Handle::new(
             self.model.clone(),
             Target::Output(id),
             path.clone(),
             self.bus.inner().clone(),
             self.wake.clone(),
         );
-        let schedule = ScheduleRelay::new(
-            self.model.clone(),
-            Target::Output(id),
-            path.clone(),
-            self.bus.inner().clone(),
-            self.wake.clone(),
-        );
-        let server = self.bus.object_server();
-        if let Err(error) = server.at(path.as_str(), relay).and_then(|_| server.at(path.as_str(), schedule)) {
+        if let Err(error) = dbus::serve(&self.bus, handle) {
             eprintln!("serpantinum-gamma: could not serve {path}: {error}");
         }
-        drop(server);
         self.reconcile();
     }
 
@@ -140,12 +140,9 @@ impl Daemon {
         slot.output.release();
         // The matrix of an output that is gone needs no reset, and the others keep theirs
         if let Some(name) = slot.name {
-            self.model.lock().unwrap().outputs.remove(&id);
+            lock(&self.model).outputs.remove(&id);
             let path = object_path(&name);
-            let server = self.bus.object_server();
-            if let Err(error) =
-                server.remove::<Relay, _>(path.as_str()).and_then(|_| server.remove::<ScheduleRelay, _>(path.as_str()))
-            {
+            if let Err(error) = dbus::unserve(&self.bus, &path) {
                 eprintln!("serpantinum-gamma: could not stop serving {path}: {error}");
             }
         }
@@ -155,33 +152,44 @@ impl Daemon {
         if !self.active {
             return;
         }
-        let model = self.model.lock().unwrap();
-        let manager = match &self.backend {
-            Backend::Gamma(manager) => manager,
-            Backend::Ctm(manager) => {
-                // A commit resets every output that was not set in it, so all go in each time
-                let wanted: Vec<_> =
-                    self.slots.iter().filter_map(|slot| Some((slot, model.outputs.get(&slot.id)?.color))).collect();
-                if wanted.iter().all(|(slot, color)| slot.applied == Some(*color)) {
-                    return;
-                }
-                for (slot, color) in &wanted {
-                    let [a, b, c, d, e, f, g, h, i] = ctm(*color);
-                    manager.set_ctm_for_output(&slot.output, a, b, c, d, e, f, g, h, i);
-                }
-                manager.commit();
-                let applied: Vec<_> = wanted.iter().map(|(slot, color)| (slot.id, *color)).collect();
-                for (id, color) in applied {
-                    if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == id) {
-                        slot.applied = Some(color);
-                    }
-                }
-                return;
-            }
-        };
+        match self.backend.clone() {
+            Backend::Gamma(manager) => self.reconcile_gamma(&manager),
+            Backend::Ctm(manager) => self.reconcile_ctm(&manager),
+        }
+    }
+
+    fn reconcile_ctm(&mut self, manager: &HyprlandCtmControlManagerV1) {
+        let model = lock(&self.model);
+        if model.blocked {
+            return;
+        }
+        // A commit resets every output that was not set in it, so all go in each time
+        let wanted: Vec<_> = self
+            .slots
+            .iter_mut()
+            .filter_map(|slot| {
+                let color = model.outputs.get(&slot.id)?.color;
+                Some((slot, color))
+            })
+            .collect();
+        if wanted.iter().all(|(slot, color)| slot.applied == Some(*color)) {
+            return;
+        }
+        for (slot, color) in &wanted {
+            let [a, b, c, d, e, f, g, h, i] = ctm(*color);
+            manager.set_ctm_for_output(&slot.output, a, b, c, d, e, f, g, h, i);
+        }
+        manager.commit();
+        for (slot, color) in wanted {
+            slot.applied = Some(color);
+        }
+    }
+
+    fn reconcile_gamma(&mut self, manager: &ZwlrGammaControlManagerV1) {
+        let model = lock(&self.model);
         for slot in &mut self.slots {
             let Some(color) = model.outputs.get(&slot.id).map(|output| output.color) else { continue };
-            if slot.failed {
+            if slot.failed.is_some() {
                 continue;
             }
             let Some(control) = &slot.control else {
@@ -257,8 +265,8 @@ impl Dispatch<ZwlrGammaControlManagerV1, ()> for Daemon {
 
 impl Dispatch<HyprlandCtmControlManagerV1, ()> for Daemon {
     fn event(
-        _: &mut Self,
-        _: &HyprlandCtmControlManagerV1,
+        daemon: &mut Self,
+        manager: &HyprlandCtmControlManagerV1,
         event: hyprland_ctm_control_manager_v1::Event,
         _: &(),
         _: &Connection,
@@ -266,6 +274,9 @@ impl Dispatch<HyprlandCtmControlManagerV1, ()> for Daemon {
     ) {
         let hyprland_ctm_control_manager_v1::Event::Blocked = event;
         eprintln!("serpantinum-gamma: Hyprland ignores this program's colours; another program holds the CTM control");
+        // The compositor asks for the manager to be destroyed, and ignores it until then
+        lock(&daemon.model).blocked = true;
+        manager.destroy();
     }
 }
 
@@ -283,6 +294,9 @@ impl Dispatch<ZwlrGammaControlV1, u32> for Daemon {
             zwlr_gamma_control_v1::Event::GammaSize { size } => {
                 slot.size = size;
                 slot.applied = None;
+                if let Some(output) = lock(&daemon.model).outputs.get_mut(id) {
+                    output.refused = false;
+                }
                 daemon.reconcile();
             }
             zwlr_gamma_control_v1::Event::Failed => {
@@ -290,11 +304,14 @@ impl Dispatch<ZwlrGammaControlV1, u32> for Daemon {
                 eprintln!(
                     "serpantinum-gamma: the compositor refused gamma control of {name}; another program may hold it"
                 );
-                slot.failed = true;
+                slot.failed = Some(Instant::now());
                 slot.size = 0;
                 slot.applied = None;
                 if let Some(control) = slot.control.take() {
                     control.destroy();
+                }
+                if let Some(output) = lock(&daemon.model).outputs.get_mut(id) {
+                    output.refused = true;
                 }
             }
             _ => {}

@@ -15,6 +15,8 @@ pub struct Output {
     pub name: String,
     pub color: Color,
     pub plan: Plan,
+    /// The compositor refused this output's gamma control, so its colours do not take effect
+    pub refused: bool,
 }
 
 /// The colours asked for over D-Bus, keyed by the outputs' Wayland registry names
@@ -29,6 +31,11 @@ pub struct Model {
     /// The Schedule properties as last signalled, so that changes made by time alone, like the
     /// sun's elevation, are signalled too
     pub signalled: Option<View>,
+    /// The compositor ignores every colour sent, as when another program holds Hyprland's colour
+    /// matrix control
+    pub blocked: bool,
+    /// The last [`Model::view`], valid for the second and the schedule it was made for
+    view_cache: Option<(i64, Schedule, View)>,
 }
 
 impl Model {
@@ -37,16 +44,12 @@ impl Model {
         match target {
             Target::Output(id) => self.outputs.get(&id).map(|output| output.color),
             Target::Root if self.outputs.is_empty() => Some(self.default),
-            Target::Root => {
-                let count = self.outputs.len();
-                let colors = || self.outputs.values().map(|output| output.color);
-                Some(Color {
-                    temperature: (colors().map(|c| c.temperature as usize).sum::<usize>() / count) as u16,
-                    gamma: colors().map(|c| c.gamma).sum::<f64>() / count as f64,
-                    brightness: colors().map(|c| c.brightness).sum::<f64>() / count as f64,
-                    inverted: colors().all(|c| c.inverted),
-                })
-            }
+            Target::Root => Some(Color {
+                temperature: self.mean(|o| o.color.temperature as f64) as u16,
+                gamma: self.mean(|o| o.color.gamma),
+                brightness: self.mean(|o| o.color.brightness),
+                inverted: self.outputs.values().all(|o| o.color.inverted),
+            }),
         }
     }
 
@@ -55,16 +58,41 @@ impl Model {
         match target {
             Target::Output(id) => self.outputs.get(&id).map(|output| output.plan),
             Target::Root if self.outputs.is_empty() => Some(self.default_plan),
-            Target::Root => {
-                let count = self.outputs.len();
-                let plans = || self.outputs.values().map(|output| output.plan);
-                Some(Plan {
-                    auto: plans().all(|p| p.auto),
-                    day_temperature: (plans().map(|p| p.day_temperature as usize).sum::<usize>() / count) as u16,
-                    night_temperature: (plans().map(|p| p.night_temperature as usize).sum::<usize>() / count) as u16,
-                })
-            }
+            Target::Root => Some(Plan {
+                auto: self.outputs.values().all(|o| o.plan.auto),
+                day_temperature: self.mean(|o| o.plan.day_temperature as f64) as u16,
+                night_temperature: self.mean(|o| o.plan.night_temperature as f64) as u16,
+            }),
         }
+    }
+
+    /// The average of `value` over the outputs, which must not be empty
+    fn mean(&self, value: impl Fn(&Output) -> f64) -> f64 {
+        self.outputs.values().map(value).sum::<f64>() / self.outputs.len() as f64
+    }
+
+    /// Whether colours for `target` are being ignored by the compositor; for `/`, whether any are
+    pub fn blocked(&self, target: Target) -> bool {
+        self.blocked
+            || match target {
+                Target::Output(id) => self.outputs.get(&id).is_some_and(|output| output.refused),
+                Target::Root => self.outputs.values().any(|output| output.refused),
+            }
+    }
+
+    /// The Schedule properties at `now`, recomputed at most once a second: reading several of them
+    /// together would otherwise search for the sunrise and sunset each time
+    pub fn view(&mut self, now: &Now) -> View {
+        let second = now.unix as i64;
+        if let Some((cached_second, schedule, view)) = self.view_cache
+            && cached_second == second
+            && schedule == self.schedule
+        {
+            return view;
+        }
+        let view = self.schedule.view(now);
+        self.view_cache = Some((second, self.schedule, view));
+        view
     }
 
     fn each(&mut self, target: Target, mut change: impl FnMut(&mut Color, &mut Plan)) {
@@ -99,7 +127,7 @@ impl Model {
     }
 
     pub fn add_output(&mut self, id: u32, name: String) {
-        self.outputs.insert(id, Output { name, color: self.default, plan: self.default_plan });
+        self.outputs.insert(id, Output { name, color: self.default, plan: self.default_plan, refused: false });
     }
 
     /// Sets the temperature of every output whose schedule is on to the scheduled one
@@ -220,6 +248,32 @@ mod tests {
         model.apply_schedule(&Now { unix: 0.0, local_minutes: 0.0 });
         let color = model.color(Target::Output(1)).unwrap();
         assert_eq!((color.temperature, color.brightness, color.gamma, color.inverted), (4000, 0.6, 1.3, true));
+    }
+
+    #[test]
+    fn blocked_follows_the_compositor_and_the_output() {
+        let mut model = two_outputs();
+        assert!(!model.blocked(Target::Root));
+        model.outputs.get_mut(&1).unwrap().refused = true;
+        assert!(model.blocked(Target::Output(1)) && model.blocked(Target::Root));
+        assert!(!model.blocked(Target::Output(2)));
+        model.outputs.get_mut(&1).unwrap().refused = false;
+        model.blocked = true;
+        assert!(model.blocked(Target::Output(2)));
+    }
+
+    #[test]
+    fn the_view_is_kept_for_a_second_and_dropped_when_the_schedule_changes() {
+        let mut model = Model::default();
+        let at = |unix| Now { unix, local_minutes: 0.0 };
+        let first = model.view(&at(100.2));
+        assert_eq!(model.view(&at(100.9)), first);
+        model.schedule.fallback_day_start = 8 * 60;
+        assert_eq!(model.view(&at(100.9)).fallback_day_start, 8 * 60);
+        model.schedule.location = crate::schedule::Location::new(55.7558, 37.6173);
+        let located = model.view(&at(100.9));
+        assert!(located.has_location);
+        assert_ne!(model.view(&at(101.1)).sun_elevation, located.sun_elevation);
     }
 
     #[test]
